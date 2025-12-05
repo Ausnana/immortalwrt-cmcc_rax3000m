@@ -1,0 +1,139 @@
+# GitHub Actions workflow: Build ImmortalWRT for device (rax3000m-nand)
+# Trigger: manual dispatch and pushes to main (adjust as needed)
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'ImmortalWRT branch to build'
+        required: false
+        default: 'master'
+      defconfig_path:
+        description: 'Path in the repo to the defconfig (relative). Leave empty to skip and require .config in repo root.'
+        required: false
+        default: 'configs/rax3000m_defconfig'
+  push:
+    branches:
+      - main
+
+name: Build ImmortalWRT (rax3000m NAND)
+
+env:
+  IMMORTAL_REPO: https://github.com/immortalwrt/immortalwrt.git
+  IMMORTAL_BRANCH: ${{ github.event.inputs.branch || 'master' }}
+  DEFCONFIG_PATH: ${{ github.event.inputs.defconfig_path || 'configs/rax3000m_defconfig' }}
+  MAKE_JOBS: ${{ runner.cores || 2 }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  BUILD_DIR: ${{ github.workspace }}/immortalwrt
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout this repo (contains config/patches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache downloads (dl) and staging/tmp (may speed up repeated builds)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/immortalwrt/dl
+            ${{ github.workspace }}/immortalwrt/build_dir
+            ${{ github.workspace }}/immortalwrt/tmp
+            ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-immortal-${{ env.IMMORTAL_BRANCH }}-dl-${{ hashFiles('**/configs/**') }}
+          restore-keys: |
+            ${{ runner.os }}-immortal-${{ env.IMMORTAL_BRANCH }}-dl-
+
+      - name: Install apt build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git asciidoc binutils bzip2 ccache python3 python3-pip \
+            libncurses5-dev zlib1g-dev gawk gettext unzip file wget xz-utils \
+            libssl-dev rsync bc perl pkg-config automake autopoint
+
+      - name: Ensure ccachesize and env
+        run: |
+          mkdir -p "${CCACHE_DIR}"
+          ccache --max-size=5G || true
+          echo "CCACHE_DIR=${CCACHE_DIR}"
+
+      - name: Clone ImmortalWRT sources
+        run: |
+          set -eux
+          if [ -d "${BUILD_DIR}" ]; then
+            echo "ImmortalWRT source already present, skipping clone"
+          else
+            git clone --depth 1 --branch "${IMMORTAL_BRANCH}" "${IMMORTAL_REPO}" "${BUILD_DIR}"
+          fi
+        working-directory: ${{ github.workspace }}
+
+      - name: Copy defconfig (if present)
+        run: |
+          set -eux
+          if [ -f "${{ github.workspace }}/${DEFCONFIG_PATH}" ]; then
+            echo "Found defconfig at ${{ github.workspace }}/${DEFCONFIG_PATH}, copying to ImmortalWRT .config"
+            cp "${{ github.workspace }}/${DEFCONFIG_PATH}" "${BUILD_DIR}/.config"
+          else
+            echo "Defconfig not found at ${{ github.workspace }}/${DEFCONFIG_PATH}."
+            if [ -f "${BUILD_DIR}/.config" ]; then
+              echo "But ${BUILD_DIR}/.config already exists, will use it."
+            else
+              echo "No .config available; the build will try to run make menuconfig/defconfig steps or fail. Add a defconfig to the repo (recommended)."
+            fi
+          fi
+
+      - name: Update feeds and install
+        run: |
+          set -eux
+          cd "${BUILD_DIR}"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Prepare build configuration (defconfig -> .config)
+        run: |
+          set -eux
+          cd "${BUILD_DIR}"
+          if [ -f .config ]; then
+            echo "Using existing .config"
+          else
+            echo ".config not found; trying to run 'make defconfig' (this may fail if no defconfig is specified)"
+            make defconfig -j"${MAKE_JOBS}"
+          fi
+          # show some config summary for debugging
+          echo "==== kernel menuconfig summary ===="
+          make kernel_menuconfig || true
+        working-directory: ${{ env.BUILD_DIR }}
+        continue-on-error: true
+
+      - name: Build ImmortalWRT (this may take a long time)
+        env:
+          CCACHE_DIR: ${{ env.CCACHE_DIR }}
+          USE_CCACHE: 1
+        run: |
+          set -eux
+          cd "${BUILD_DIR}"
+          # Ensure ccache is used
+          export PATH="/usr/lib/ccache:$PATH" || true
+          # Use make -j with number of cores (use smaller if runner OOM)
+          make -j "${MAKE_JOBS}" V=s
+        working-directory: ${{ env.BUILD_DIR }}
+
+      - name: Upload build artifacts (bin/targets and packages)
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-build-${{ github.run_id }}
+          path: |
+            ${BUILD_DIR}/bin/targets
+            ${BUILD_DIR}/bin/packages
+            ${BUILD_DIR}/logs || true
+
+      - name: Show build outputs list
+        run: |
+          echo "Artifact files (if build succeeded):"
+          ls -lah "${BUILD_DIR}/bin/targets" || true
+          ls -lah "${BUILD_DIR}/bin/packages" || true
